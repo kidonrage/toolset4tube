@@ -1,0 +1,73 @@
+profile_id: current
+
+goals:
+  - Grow as a mobile developer working at Yandex.
+  - Build senior engineering judgment.
+  - Learn practical AI agent workflows.
+  - Develop own products with strong product thinking.
+
+high_value_topics:
+  - iOS architecture
+  - Swift
+  - SwiftUI
+  - UIKit
+  - Kotlin
+  - Kotlin Multiplatform
+  - mobile performance
+  - modularization
+  - SDK design
+  - testing
+  - CI/CD
+  - observability
+  - system design
+  - engineering leadership
+  - code review
+  - mentoring
+  - AI coding agents
+  - workflow automation
+  - product engineering
+  - metrics
+  - experiments
+
+medium_value_topics:
+  - startup ownership
+  - communication
+  - stakeholder management
+  - developer tools
+  - practical productivity systems
+
+low_value_topics:
+  - generic motivation
+  - vague productivity advice
+  - shallow AI hype
+  - outdated tutorials
+  - long podcasts without practical takeaways
+  - news without direct relevance
+
+decision_policy:
+  delete_if:
+    - Low relevance to current goals.
+    - Duplicates a topic already covered by better videos.
+    - Vague title and vague description.
+    - Old tutorial on fast-changing technology.
+    - Motivational content without practical value.
+
+  summary_enough_if:
+    - Useful but mostly conceptual.
+    - Long but extractable.
+    - Relevant to broad thinking, not immediate skill growth.
+
+  watch_fully_if:
+    - Contains practical implementation details.
+    - Strongly relevant to current work or near-term goals.
+    - Comes from a high-signal source.
+    - Hard to replace with a summary.
+
+  watch_partial_if:
+    - Long video with only some relevant sections.
+    - Chapters, description, or transcript allow reliable ranges.
+
+  low_confidence_if:
+    - Metadata is too vague.
+    - Relevance looks high but evidence is weak.
+    - Subtitles or transcript are needed before making a deletion decision.
