@@ -7,6 +7,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,28 @@ DECISION_LABELS = {
     "DELETE",
     "LOW_CONFIDENCE",
 }
+
+
+class TerminalProgress:
+    def __init__(self) -> None:
+        self.enabled = sys.stderr.isatty()
+        self.last_len = 0
+
+    def update(self, message: str) -> None:
+        if self.enabled:
+            padding = " " * max(0, self.last_len - len(message))
+            print(f"\r{message}{padding}", end="", file=sys.stderr, flush=True)
+            self.last_len = len(message)
+        else:
+            print(message, file=sys.stderr, flush=True)
+
+    def finish(self, message: str) -> None:
+        if self.enabled and self.last_len:
+            padding = " " * max(0, self.last_len - len(message))
+            print(f"\r{message}{padding}", file=sys.stderr, flush=True)
+        else:
+            print(message, file=sys.stderr, flush=True)
+        self.last_len = 0
 
 
 def utc_now() -> str:
@@ -93,22 +117,49 @@ def cmd_init(_: argparse.Namespace) -> int:
     return 0
 
 
-def run_ytdlp(playlist_url: str) -> dict[str, Any]:
+def run_ytdlp(playlist_url: str, progress: TerminalProgress | None = None) -> dict[str, Any]:
     if shutil.which("yt-dlp") is None:
         raise RuntimeError("yt-dlp not found in PATH. Install yt-dlp separately, then rerun scan.")
 
-    proc = subprocess.run(
-        ["yt-dlp", "--flat-playlist", "--dump-single-json", playlist_url],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    started_at = time.monotonic()
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8"
+    ) as stderr_file:
+        proc = subprocess.Popen(
+            ["yt-dlp", "--flat-playlist", "--dump-single-json", playlist_url],
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+        )
+        try:
+            while proc.poll() is None:
+                if progress is not None:
+                    elapsed = int(time.monotonic() - started_at)
+                    progress.update(
+                        "fetching playlist with yt-dlp | "
+                        f"elapsed: {elapsed}s | processed: 0, errors: 0"
+                    )
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            raise
+
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read()
+        stderr = stderr_file.read()
+
     if proc.returncode != 0:
-        detail = proc.stderr.strip() or proc.stdout.strip() or "yt-dlp failed without output"
+        detail = stderr.strip() or stdout.strip() or "yt-dlp failed without output"
         raise RuntimeError(f"yt-dlp failed: {detail}")
 
     try:
-        payload = json.loads(proc.stdout)
+        payload = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"yt-dlp returned invalid JSON: {exc}") from exc
 
@@ -144,16 +195,62 @@ def video_url(video_id: str, entry: dict[str, Any]) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
+def progress_line(stage: str, current: int, total: int, current_percent: int, processed: int, errors: int, skipped: int) -> str:
+    total_percent = int((current / total) * 100) if total else 100
+    return (
+        f"{stage} | video: {current}/{total} ({total_percent}%) | "
+        f"current video: {current_percent}% | processed: {processed}, errors: {errors}, skipped: {skipped}"
+    )
+
+
+def mark_scan_error(conn: sqlite3.Connection, entry: dict[str, Any], index: int, error: Exception, now: str) -> None:
+    video_id = video_id_from_entry(entry)
+    if not video_id:
+        return
+    conn.execute(
+        """
+        insert into videos (
+            video_id, url, title, channel, duration, description, upload_date,
+            playlist_position, raw_metadata_path, scan_status, last_error,
+            created_at, updated_at
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        on conflict(video_id) do update set
+            scan_status = excluded.scan_status,
+            last_error = excluded.last_error,
+            updated_at = excluded.updated_at
+        """,
+        (
+            video_id,
+            video_url(video_id, entry),
+            entry.get("title"),
+            entry.get("channel") or entry.get("uploader") or entry.get("uploader_id"),
+            value_as_int(entry.get("duration")),
+            entry.get("description") or "",
+            entry.get("upload_date") or entry.get("release_date"),
+            value_as_int(entry.get("playlist_index")) or index,
+            str(METADATA_DIR / f"{video_id}.json"),
+            "ERROR",
+            str(error),
+            now,
+            now,
+        ),
+    )
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     init_db()
+    progress = TerminalProgress()
     try:
-        playlist = run_ytdlp(args.playlist_url)
+        playlist = run_ytdlp(args.playlist_url, progress)
     except RuntimeError as exc:
+        progress.finish("fetching playlist failed | processed: 0, errors: 1")
         print(f"scan failed: {exc}", file=sys.stderr)
         return 2
 
     entries = playlist.get("entries") or []
     if not isinstance(entries, list):
+        progress.finish("fetching playlist failed | processed: 0, errors: 1")
         print("scan failed: yt-dlp JSON has no entries list", file=sys.stderr)
         return 2
 
@@ -161,65 +258,88 @@ def cmd_scan(args: argparse.Namespace) -> int:
     now = utc_now()
     scanned = 0
     skipped = 0
+    errors = 0
+    total = len(selected)
+    progress.finish(f"playlist fetched | videos selected: {total}")
 
     with connect_db() as conn:
         for index, entry in enumerate(selected, start=args.offset + 1):
+            current = index - args.offset
+            progress.update(progress_line("scanning metadata", current, total, 0, scanned, errors, skipped))
             if not isinstance(entry, dict):
                 skipped += 1
+                progress.update(progress_line("scanning metadata", current, total, 100, scanned, errors, skipped))
                 continue
             video_id = video_id_from_entry(entry)
             if not video_id:
                 skipped += 1
+                progress.update(progress_line("scanning metadata", current, total, 100, scanned, errors, skipped))
                 continue
 
-            raw_path = METADATA_DIR / f"{video_id}.json"
-            raw_path.write_text(json.dumps(entry, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            try:
+                raw_path = METADATA_DIR / f"{video_id}.json"
+                raw_path.write_text(json.dumps(entry, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
 
-            position = value_as_int(entry.get("playlist_index")) or index
-            conn.execute(
-                """
-                insert into videos (
-                    video_id, url, title, channel, duration, description, upload_date,
-                    playlist_position, raw_metadata_path, scan_status, last_error,
-                    created_at, updated_at
+                position = value_as_int(entry.get("playlist_index")) or index
+                conn.execute(
+                    """
+                    insert into videos (
+                        video_id, url, title, channel, duration, description, upload_date,
+                        playlist_position, raw_metadata_path, scan_status, last_error,
+                        created_at, updated_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    on conflict(video_id) do update set
+                        url = excluded.url,
+                        title = excluded.title,
+                        channel = excluded.channel,
+                        duration = excluded.duration,
+                        description = excluded.description,
+                        upload_date = excluded.upload_date,
+                        playlist_position = excluded.playlist_position,
+                        raw_metadata_path = excluded.raw_metadata_path,
+                        scan_status = excluded.scan_status,
+                        last_error = excluded.last_error,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        video_id,
+                        video_url(video_id, entry),
+                        entry.get("title"),
+                        entry.get("channel") or entry.get("uploader") or entry.get("uploader_id"),
+                        value_as_int(entry.get("duration")),
+                        entry.get("description") or "",
+                        entry.get("upload_date") or entry.get("release_date"),
+                        position,
+                        str(raw_path),
+                        "METADATA_FETCHED",
+                        None,
+                        now,
+                        now,
+                    ),
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(video_id) do update set
-                    url = excluded.url,
-                    title = excluded.title,
-                    channel = excluded.channel,
-                    duration = excluded.duration,
-                    description = excluded.description,
-                    upload_date = excluded.upload_date,
-                    playlist_position = excluded.playlist_position,
-                    raw_metadata_path = excluded.raw_metadata_path,
-                    scan_status = excluded.scan_status,
-                    last_error = excluded.last_error,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    video_id,
-                    video_url(video_id, entry),
-                    entry.get("title"),
-                    entry.get("channel") or entry.get("uploader") or entry.get("uploader_id"),
-                    value_as_int(entry.get("duration")),
-                    entry.get("description") or "",
-                    entry.get("upload_date") or entry.get("release_date"),
-                    position,
-                    str(raw_path),
-                    "METADATA_FETCHED",
-                    None,
-                    now,
-                    now,
-                ),
-            )
-            scanned += 1
+                scanned += 1
+            except OSError as exc:
+                errors += 1
+                try:
+                    mark_scan_error(conn, entry, index, exc, now)
+                except sqlite3.Error:
+                    pass
+            except sqlite3.Error as exc:
+                errors += 1
+                try:
+                    mark_scan_error(conn, entry, index, exc, now)
+                except sqlite3.Error:
+                    pass
+            progress.update(progress_line("scanning metadata", current, total, 100, scanned, errors, skipped))
         conn.commit()
 
+    progress.finish(progress_line("scan complete", total, total, 100, scanned, errors, skipped))
     print(f"Scanned: {scanned}")
+    print(f"Errors: {errors}")
     print(f"Skipped: {skipped}")
     print(f"Metadata dir: {METADATA_DIR}")
-    return 0
+    return 1 if errors else 0
 
 
 def load_videos(limit: int) -> list[sqlite3.Row]:

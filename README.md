@@ -35,6 +35,10 @@ toolset4tube context --profile profile.example.yaml --limit 50
 toolset4tube report
 ```
 
+`scan` writes live progress to stderr while `yt-dlp` fetches the playlist and while
+selected entries are cached locally. Final counts are printed as scanned, errors, and
+skipped.
+
 The agent reads `data/reports/agent-context.md`, writes decisions to
 `data/reports/decisions.jsonl`, then `toolset4tube report` renders
 `data/reports/report.md` and `data/reports/delete-candidates.csv`.
