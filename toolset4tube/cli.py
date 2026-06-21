@@ -157,7 +157,6 @@ def run_ytdlp_entries(playlist_url: str, offset: int, limit: int, progress: Term
                             "fetching metadata",
                             current,
                             limit,
-                            0,
                             len(entries),
                             bad_lines,
                             0,
@@ -173,19 +172,18 @@ def run_ytdlp_entries(playlist_url: str, offset: int, limit: int, progress: Term
                     continue
 
                 current = min(len(entries) + bad_lines + 1, limit)
-                progress.update(progress_line("fetching metadata", current, limit, 50, len(entries), bad_lines, 0))
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     bad_lines += 1
-                    progress.update(progress_line("fetching metadata", current, limit, 100, len(entries), bad_lines, 0))
+                    progress.update(progress_line("fetching metadata", current, limit, len(entries), bad_lines, 0))
                     current = min(len(entries) + bad_lines + 1, limit)
                     continue
                 if isinstance(entry, dict):
                     entries.append(entry)
                 else:
                     bad_lines += 1
-                progress.update(progress_line("fetching metadata", current, limit, 100, len(entries), bad_lines, 0))
+                progress.update(progress_line("fetching metadata", current, limit, len(entries), bad_lines, 0))
                 current = min(len(entries) + bad_lines + 1, limit)
         except KeyboardInterrupt:
             proc.terminate()
@@ -246,7 +244,6 @@ def progress_line(
     stage: str,
     current: int,
     total: int,
-    current_percent: int,
     processed: int,
     errors: int,
     skipped: int,
@@ -255,7 +252,7 @@ def progress_line(
     total_percent = int((current / total) * 100) if total else 100
     line = (
         f"{stage} | video: {current}/{total} ({total_percent}%) | "
-        f"current video: {current_percent}% | processed: {processed}, errors: {errors}, skipped: {skipped}"
+        f"processed: {processed}, errors: {errors}, skipped: {skipped}"
     )
     if detail:
         line = f"{line} | {detail}"
@@ -316,15 +313,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
     with connect_db() as conn:
         for index, entry in enumerate(selected, start=args.offset + 1):
             current = index - args.offset
-            progress.update(progress_line("scanning metadata", current, total, 0, scanned, errors, skipped))
+            progress.update(progress_line("scanning metadata", current, total, scanned, errors, skipped))
             if not isinstance(entry, dict):
                 skipped += 1
-                progress.update(progress_line("scanning metadata", current, total, 100, scanned, errors, skipped))
+                progress.update(progress_line("scanning metadata", current, total, scanned, errors, skipped))
                 continue
             video_id = video_id_from_entry(entry)
             if not video_id:
                 skipped += 1
-                progress.update(progress_line("scanning metadata", current, total, 100, scanned, errors, skipped))
+                progress.update(progress_line("scanning metadata", current, total, scanned, errors, skipped))
                 continue
 
             try:
@@ -382,7 +379,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
                     mark_scan_error(conn, entry, index, exc, now)
                 except sqlite3.Error:
                     pass
-            progress.update(progress_line("scanning metadata", current, total, 100, scanned, errors, skipped))
+            progress.update(progress_line("scanning metadata", current, total, scanned, errors, skipped))
         conn.commit()
 
     progress.end_live_line()
