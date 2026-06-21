@@ -12,7 +12,19 @@ local evidence files, and renders reports from decisions made by an AI agent.
 python3 -m pip install -e .
 ```
 
-`yt-dlp` must be installed separately and available in `PATH` for `scan`.
+## Dependencies
+
+- Python 3.11+.
+- `yt-dlp` installed separately and available in `PATH`.
+
+Use the latest stable `yt-dlp` release. As of 2026-06-21, the latest upstream release is
+`2026.06.09`. Check your local version with:
+
+```bash
+yt-dlp --version
+```
+
+If `scan` starts failing against YouTube, update `yt-dlp` before debugging this tool.
 
 ## Commands
 
