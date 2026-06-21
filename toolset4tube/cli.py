@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import select
 import shutil
 import sqlite3
 import subprocess
@@ -53,6 +54,11 @@ class TerminalProgress:
         else:
             print(message, file=sys.stderr, flush=True)
         self.last_len = 0
+
+    def end_live_line(self) -> None:
+        if self.enabled and self.last_len:
+            print(file=sys.stderr, flush=True)
+            self.last_len = 0
 
 
 def utc_now() -> str:
@@ -117,29 +123,70 @@ def cmd_init(_: argparse.Namespace) -> int:
     return 0
 
 
-def run_ytdlp(playlist_url: str, progress: TerminalProgress | None = None) -> dict[str, Any]:
+def run_ytdlp_entries(playlist_url: str, offset: int, limit: int, progress: TerminalProgress) -> tuple[list[dict[str, Any]], int]:
     if shutil.which("yt-dlp") is None:
         raise RuntimeError("yt-dlp not found in PATH. Install yt-dlp separately, then rerun scan.")
 
     started_at = time.monotonic()
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
-        mode="w+", encoding="utf-8"
-    ) as stderr_file:
+    entries: list[dict[str, Any]] = []
+    bad_lines = 0
+    current = 1 if limit else 0
+    playlist_items = f"{offset + 1}:{offset + limit}"
+    stopped_after_limit = False
+
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr_file:
         proc = subprocess.Popen(
-            ["yt-dlp", "--flat-playlist", "--dump-single-json", playlist_url],
-            stdout=stdout_file,
+            ["yt-dlp", "--flat-playlist", "--dump-json", "--playlist-items", playlist_items, playlist_url],
+            stdout=subprocess.PIPE,
             stderr=stderr_file,
             text=True,
+            bufsize=1,
         )
         try:
-            while proc.poll() is None:
-                if progress is not None:
+            while len(entries) + bad_lines < limit:
+                if proc.stdout is None:
+                    raise RuntimeError("yt-dlp stdout pipe was not created")
+
+                ready, _, _ = select.select([proc.stdout], [], [], 0.5)
+                if not ready:
+                    if proc.poll() is not None:
+                        break
                     elapsed = int(time.monotonic() - started_at)
                     progress.update(
-                        "fetching playlist with yt-dlp | "
-                        f"elapsed: {elapsed}s | processed: 0, errors: 0"
+                        progress_line(
+                            "fetching metadata",
+                            current,
+                            limit,
+                            0,
+                            len(entries),
+                            bad_lines,
+                            0,
+                            f"elapsed: {elapsed}s",
+                        )
                     )
-                time.sleep(0.5)
+                    continue
+
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    continue
+
+                current = min(len(entries) + bad_lines + 1, limit)
+                progress.update(progress_line("fetching metadata", current, limit, 50, len(entries), bad_lines, 0))
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    bad_lines += 1
+                    progress.update(progress_line("fetching metadata", current, limit, 100, len(entries), bad_lines, 0))
+                    current = min(len(entries) + bad_lines + 1, limit)
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+                else:
+                    bad_lines += 1
+                progress.update(progress_line("fetching metadata", current, limit, 100, len(entries), bad_lines, 0))
+                current = min(len(entries) + bad_lines + 1, limit)
         except KeyboardInterrupt:
             proc.terminate()
             try:
@@ -149,23 +196,23 @@ def run_ytdlp(playlist_url: str, progress: TerminalProgress | None = None) -> di
                 proc.wait()
             raise
 
-        stdout_file.seek(0)
+        if proc.returncode is None:
+            stopped_after_limit = len(entries) + bad_lines >= limit
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
         stderr_file.seek(0)
-        stdout = stdout_file.read()
         stderr = stderr_file.read()
 
-    if proc.returncode != 0:
-        detail = stderr.strip() or stdout.strip() or "yt-dlp failed without output"
+    if proc.returncode != 0 and not stopped_after_limit:
+        detail = stderr.strip() or "yt-dlp failed without output"
         raise RuntimeError(f"yt-dlp failed: {detail}")
 
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"yt-dlp returned invalid JSON: {exc}") from exc
-
-    if not isinstance(payload, dict):
-        raise RuntimeError("yt-dlp returned an unexpected JSON shape")
-    return payload
+    return entries, bad_lines
 
 
 def value_as_int(value: Any) -> int | None:
@@ -195,12 +242,24 @@ def video_url(video_id: str, entry: dict[str, Any]) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
-def progress_line(stage: str, current: int, total: int, current_percent: int, processed: int, errors: int, skipped: int) -> str:
+def progress_line(
+    stage: str,
+    current: int,
+    total: int,
+    current_percent: int,
+    processed: int,
+    errors: int,
+    skipped: int,
+    detail: str | None = None,
+) -> str:
     total_percent = int((current / total) * 100) if total else 100
-    return (
+    line = (
         f"{stage} | video: {current}/{total} ({total_percent}%) | "
         f"current video: {current_percent}% | processed: {processed}, errors: {errors}, skipped: {skipped}"
     )
+    if detail:
+        line = f"{line} | {detail}"
+    return line
 
 
 def mark_scan_error(conn: sqlite3.Connection, entry: dict[str, Any], index: int, error: Exception, now: str) -> None:
@@ -242,25 +301,17 @@ def cmd_scan(args: argparse.Namespace) -> int:
     init_db()
     progress = TerminalProgress()
     try:
-        playlist = run_ytdlp(args.playlist_url, progress)
+        selected, fetch_errors = run_ytdlp_entries(args.playlist_url, args.offset, args.limit, progress)
     except RuntimeError as exc:
-        progress.finish("fetching playlist failed | processed: 0, errors: 1")
+        progress.finish("fetching metadata failed | processed: 0, errors: 1")
         print(f"scan failed: {exc}", file=sys.stderr)
         return 2
 
-    entries = playlist.get("entries") or []
-    if not isinstance(entries, list):
-        progress.finish("fetching playlist failed | processed: 0, errors: 1")
-        print("scan failed: yt-dlp JSON has no entries list", file=sys.stderr)
-        return 2
-
-    selected = entries[args.offset : args.offset + args.limit]
     now = utc_now()
     scanned = 0
     skipped = 0
-    errors = 0
-    total = len(selected)
-    progress.finish(f"playlist fetched | videos selected: {total}")
+    errors = fetch_errors
+    total = args.limit
 
     with connect_db() as conn:
         for index, entry in enumerate(selected, start=args.offset + 1):
@@ -334,7 +385,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             progress.update(progress_line("scanning metadata", current, total, 100, scanned, errors, skipped))
         conn.commit()
 
-    progress.finish(progress_line("scan complete", total, total, 100, scanned, errors, skipped))
+    progress.end_live_line()
     print(f"Scanned: {scanned}")
     print(f"Errors: {errors}")
     print(f"Skipped: {skipped}")
